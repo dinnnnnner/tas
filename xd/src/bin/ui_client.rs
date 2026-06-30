@@ -4,7 +4,7 @@ use demo2::ingress::can::enqueue_can_tx;
 use demo2::signal::{RawSample, SignalKind, SignalProcessor, SignalSample, default_signal_specs};
 use demo2::transport::can::CanTxFrame;
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{Line, Plot, PlotPoints, Points};
 use futures_util::{TryStreamExt, pin_mut};
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
@@ -33,6 +33,10 @@ const SCALE_MIN: f32 = 0.6;
 const SCALE_MAX: f32 = 2.4;
 const MAX_POINTS_PER_SERIES: usize = 4096;
 const UI_QUEUE_CAPACITY: usize = 50_000;
+const ALARM_DB_QUEUE_CAPACITY: usize = 10_000;
+const ALARM_RECORD_DEFAULT_WINDOW_MS: i64 = 5 * 60 * 1000;
+const ALARM_RECORD_PAGE_SIZE: i64 = 50;
+const ALARM_REPLAY_CONTEXT_MS: i64 = 30 * 1000;
 const SELF_TEST_CAN_ID: u32 = 0x123;
 const SELF_TEST_CAN_DLC: u8 = 8;
 const SELF_TEST_CAN_DATA: [u8; 8] = [0xA5, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
@@ -81,6 +85,7 @@ enum UiMsg {
     Alarm(AlarmEvent),
     CanReplayLoaded(ReplayMode, Result<CanReplayData, String>),
     CanReplayExported(Result<String, String>),
+    AlarmRecordsLoaded(Result<AlarmRecordData, String>),
 }
 
 #[derive(Default)]
@@ -164,6 +169,68 @@ fn load_pg_dsn() -> String {
             .filter(|dsn| !dsn.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_PG_DSN.to_string()),
         Err(_) => DEFAULT_PG_DSN.to_string(),
+    }
+}
+
+fn start_local_alarm_db_writer(pg_dsn: String) -> SyncSender<AlarmEvent> {
+    let (tx, rx) = mpsc::sync_channel::<AlarmEvent>(ALARM_DB_QUEUE_CAPACITY);
+    thread::spawn(move || run_local_alarm_db_writer(pg_dsn, rx));
+    tx
+}
+
+fn run_local_alarm_db_writer(pg_dsn: String, rx: Receiver<AlarmEvent>) {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("local alarm db runtime init failed: {err}");
+            return;
+        }
+    };
+
+    let (client, connection) = match rt.block_on(tokio_postgres::connect(&pg_dsn, NoTls)) {
+        Ok(parts) => parts,
+        Err(err) => {
+            eprintln!("local alarm db connect failed: {err}");
+            return;
+        }
+    };
+
+    rt.spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("local alarm db connection failed: {err}");
+        }
+    });
+
+    for alarm in rx {
+        let ts_ms = alarm
+            .raised_at
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_else(|_| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as i64)
+                    .unwrap_or(0)
+            });
+        let level = format!("{:?}", alarm.level);
+        let result = rt.block_on(client.execute(
+            "INSERT INTO alarm_events (ts_ms, device_id, alarm_id, level, message, cleared)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &ts_ms,
+                &alarm.device_id,
+                &alarm.alarm_id,
+                &level,
+                &alarm.message,
+                &alarm.cleared,
+            ],
+        ));
+        if let Err(err) = result {
+            eprintln!("local alarm db write failed: {err}");
+        }
     }
 }
 
@@ -681,6 +748,25 @@ impl Default for SentAngleJumpThresholds {
     }
 }
 
+#[derive(Clone, Debug)]
+struct AlarmPlotPoint {
+    point: [f64; 2],
+    level: String,
+    cleared: bool,
+}
+
+fn nearest_plot_point(points: &[[f64; 2]], x_sec: f64) -> Option<[f64; 2]> {
+    points
+        .iter()
+        .min_by(|a, b| {
+            (a[0] - x_sec)
+                .abs()
+                .partial_cmp(&(b[0] - x_sec).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .copied()
+}
+
 #[derive(Clone, Debug, Default)]
 struct CanReplayData {
     x_points: Vec<[f64; 2]>,
@@ -688,6 +774,11 @@ struct CanReplayData {
     z_points: Vec<[f64; 2]>,
     u_points: Vec<[f64; 2]>,
     v_points: Vec<[f64; 2]>,
+    x_alarm_points: Vec<AlarmPlotPoint>,
+    y_alarm_points: Vec<AlarmPlotPoint>,
+    z_alarm_points: Vec<AlarmPlotPoint>,
+    u_alarm_points: Vec<AlarmPlotPoint>,
+    v_alarm_points: Vec<AlarmPlotPoint>,
     min_ts_ms: i64,
     max_ts_ms: i64,
 }
@@ -763,6 +854,7 @@ struct CanReplayState {
     show_z: bool,
     show_u: bool,
     show_v: bool,
+    show_alarm_points: bool,
     data: Option<CanReplayData>,
     view_start_sec: f64,
     view_span_sec: f64,
@@ -785,6 +877,7 @@ impl CanReplayState {
             show_z: true,
             show_u: true,
             show_v: true,
+            show_alarm_points: true,
             data: None,
             view_start_sec: 0.0,
             view_span_sec: 60.0,
@@ -793,9 +886,74 @@ impl CanReplayState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct AlarmRecordRow {
+    ts_ms: i64,
+    device_id: String,
+    alarm_id: String,
+    level: String,
+    message: String,
+    cleared: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AlarmRecordData {
+    records: Vec<AlarmRecordRow>,
+    page_index: i64,
+    has_next: bool,
+    total_count: i64,
+}
+
+impl AlarmRecordData {
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+struct AlarmRecordState {
+    open: bool,
+    loading: bool,
+    status: String,
+    pg_dsn: String,
+    start_ts_input: String,
+    end_ts_input: String,
+    show_can_x: bool,
+    show_can_y: bool,
+    show_can_z: bool,
+    show_sent_t1: bool,
+    show_sent_t2: bool,
+    show_sent_s: bool,
+    page_index: i64,
+    has_next: bool,
+    data: Option<AlarmRecordData>,
+}
+
+impl AlarmRecordState {
+    fn new(pg_dsn: String) -> Self {
+        Self {
+            open: false,
+            loading: false,
+            status: "未加载".to_string(),
+            pg_dsn,
+            start_ts_input: String::new(),
+            end_ts_input: String::new(),
+            show_can_x: true,
+            show_can_y: true,
+            show_can_z: true,
+            show_sent_t1: true,
+            show_sent_t2: true,
+            show_sent_s: true,
+            page_index: 0,
+            has_next: false,
+            data: None,
+        }
+    }
+}
+
 struct UiClientApp {
     rx: Receiver<UiMsg>,
     ui_tx: SyncSender<UiMsg>,
+    local_alarm_db_tx: SyncSender<AlarmEvent>,
     feed_stats: Arc<FeedStats>,
     feed_addr: String,
     status: String,
@@ -824,6 +982,7 @@ struct UiClientApp {
     sent_angle_jump_states: HashMap<(String, usize), SentAngleJumpState>,
     last_can_self_test_result: String,
     can_replay: CanReplayState,
+    alarm_records: AlarmRecordState,
 }
 
 impl UiClientApp {
@@ -843,9 +1002,11 @@ impl UiClientApp {
         feed_addr: String,
         pg_dsn: String,
     ) -> Self {
+        let local_alarm_db_tx = start_local_alarm_db_writer(pg_dsn.clone());
         Self {
             rx,
             ui_tx,
+            local_alarm_db_tx,
             feed_stats,
             feed_addr,
             status: "starting...".to_string(),
@@ -873,7 +1034,8 @@ impl UiClientApp {
             sent_angle_jump_thresholds: SentAngleJumpThresholds::default(),
             sent_angle_jump_states: HashMap::new(),
             last_can_self_test_result: "未执行".to_string(),
-            can_replay: CanReplayState::new(pg_dsn),
+            can_replay: CanReplayState::new(pg_dsn.clone()),
+            alarm_records: AlarmRecordState::new(pg_dsn),
         }
     }
 
@@ -967,6 +1129,40 @@ impl UiClientApp {
                         Err(err) => format!("导出失败: {err}"),
                     };
                 }
+                UiMsg::AlarmRecordsLoaded(result) => {
+                    self.alarm_records.loading = false;
+                    match result {
+                        Ok(data) => {
+                            let count = data.records.len();
+                            self.alarm_records.page_index = data.page_index;
+                            self.alarm_records.has_next = data.has_next;
+                            self.alarm_records.status = if data.is_empty() {
+                                format!("第 {} 页没有报警记录", data.page_index + 1)
+                            } else {
+                                format!("第 {} 页，{} 条报警记录", data.page_index + 1, count)
+                            };
+                            self.alarm_records.status = if data.is_empty() {
+                                format!(
+                                    "第 {} 页没有报警记录，总报警记录 {} 条",
+                                    data.page_index + 1,
+                                    data.total_count
+                                )
+                            } else {
+                                format!(
+                                    "第 {} 页，{} 条报警记录，总报警记录 {} 条",
+                                    data.page_index + 1,
+                                    count,
+                                    data.total_count
+                                )
+                            };
+                            self.alarm_records.data = Some(data);
+                        }
+                        Err(err) => {
+                            self.alarm_records.status = format!("加载失败: {err}");
+                            self.alarm_records.data = None;
+                        }
+                    }
+                }
 
                 
                 UiMsg::Sample(sample) => {
@@ -1041,6 +1237,19 @@ impl UiClientApp {
         while self.alarm_history.len() > Self::MAX_ALARM_HISTORY {
             self.alarm_history.pop_back();
         }
+    }
+
+    fn apply_local_alarm(&mut self, alarm: AlarmEvent) {
+        match self.local_alarm_db_tx.try_send(alarm.clone()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.status = "local alarm db queue full, dropped alarm db write".to_string();
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.status = "local alarm db writer disconnected".to_string();
+            }
+        }
+        self.apply_alarm(alarm);
     }
 
     fn parse_optional_threshold(text: &str) -> Option<f64> {
@@ -1118,7 +1327,7 @@ impl UiClientApp {
         value: f64,
         cleared: bool,
     ) {
-        self.apply_alarm(AlarmEvent {
+        self.apply_local_alarm(AlarmEvent {
             device_id: device_id.to_string(),
             alarm_id: format!("can_{axis}_{bound}"),
             level: AlarmLevel::Warning,
@@ -1278,7 +1487,7 @@ impl UiClientApp {
             _ => AlarmLevel::Warning,
         };
         let (warn, red, purple) = self.sent_jump_thresholds();
-        self.apply_alarm(AlarmEvent {
+        self.apply_local_alarm(AlarmEvent {
             device_id: device_id.to_string(),
             alarm_id: format!("sent_torque_jump_{}", if sensor_id == 1 { "t1" } else { "t2" }),
             level: alarm_level,
@@ -1364,7 +1573,7 @@ impl UiClientApp {
             4 => "s",
             _ => "unknown",
         };
-        self.apply_alarm(AlarmEvent {
+        self.apply_local_alarm(AlarmEvent {
             device_id: device_id.to_string(),
             alarm_id: format!("sent_angle_jump_{angle_name}"),
             level: AlarmLevel::Critical,
@@ -2014,7 +2223,17 @@ impl UiClientApp {
             });
     }
 
-    fn draw_alarm_panel(&self, ctx: &egui::Context) {
+    fn clear_alarm_panel_stats(&mut self) {
+        self.active_alarms.clear();
+        self.alarm_history.clear();
+        self.total_alarm_count = 0;
+        self.can_alarm_states.clear();
+        self.sent_jump_states.clear();
+        self.sent_angle_jump_states.clear();
+        self.status = "报警面板和报警统计已清除".to_string();
+    }
+
+    fn draw_alarm_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("alarm_panel")
             .resizable(true)
             .default_height(300.0)
@@ -2022,6 +2241,10 @@ impl UiClientApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("报警次数: {}", self.total_alarm_count));
+                    ui.separator();
+                    if ui.button("清除报警").clicked() {
+                        self.clear_alarm_panel_stats();
+                    }
                     ui.separator();
                     ui.heading("报警");
                     ui.separator();
@@ -2484,6 +2707,74 @@ impl UiClientApp {
                         }
                     }
 
+                    let alarm_rows = client
+                        .query(
+                            "SELECT ts_ms, alarm_id, level, message, cleared
+                             FROM alarm_events
+                             WHERE ts_ms >= $1
+                               AND ts_ms <= $2
+                               AND (alarm_id LIKE 'can_%' OR alarm_id LIKE 'sent_%')
+                             ORDER BY ts_ms ASC, id ASC",
+                            &[&start_ts_ms, &end_ts_ms],
+                        )
+                        .await
+                        .map_err(|err| err.to_string())?;
+
+                    for row in alarm_rows {
+                        let ts_ms: i64 = row.get(0);
+                        let alarm_id: String = row.get(1);
+                        let level: String = row.get(2);
+                        let message: String = row.get(3);
+                        let cleared: bool = row.get(4);
+                        let x_sec = (ts_ms - start_ts_ms) as f64 / 1000.0;
+                        match mode {
+                            ReplayMode::Can3Axis => {
+                                let target = if alarm_id.starts_with("can_x_") {
+                                    Some((&data.x_points, &mut data.x_alarm_points))
+                                } else if alarm_id.starts_with("can_y_") {
+                                    Some((&data.y_points, &mut data.y_alarm_points))
+                                } else if alarm_id.starts_with("can_z_") {
+                                    Some((&data.z_points, &mut data.z_alarm_points))
+                                } else {
+                                    None
+                                };
+                                if let Some((series, alarms)) = target {
+                                    if let Some(point) = nearest_plot_point(series, x_sec) {
+                                        alarms.push(AlarmPlotPoint {
+                                            point: [x_sec, point[1]],
+                                            level,
+                                            cleared,
+                                        });
+                                    }
+                                }
+                            }
+                            ReplayMode::Sent => {
+                                let target = if alarm_id == "sent_torque_jump_t1" {
+                                    Some((&data.y_points, &mut data.y_alarm_points))
+                                } else if alarm_id == "sent_angle_jump_t1" || message.contains("t1=1") {
+                                    Some((&data.x_points, &mut data.x_alarm_points))
+                                } else if alarm_id == "sent_torque_jump_t2" {
+                                    Some((&data.u_points, &mut data.u_alarm_points))
+                                } else if alarm_id == "sent_angle_jump_t2" || message.contains("t2=1") {
+                                    Some((&data.z_points, &mut data.z_alarm_points))
+                                } else if alarm_id == "sent_angle_jump_s" || message.contains("s=1") {
+                                    Some((&data.v_points, &mut data.v_alarm_points))
+                                } else {
+                                    None
+                                };
+                                if let Some((series, alarms)) = target {
+                                    if let Some(point) = nearest_plot_point(series, x_sec) {
+                                        alarms.push(AlarmPlotPoint {
+                                            point: [x_sec, point[1]],
+                                            level,
+                                            cleared,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     Ok(data)
                 })
             })();
@@ -2649,6 +2940,26 @@ impl UiClientApp {
         format!("{hour:02}:{minute:02}:{second:02}")
     }
 
+    fn draw_alarm_plot_points(
+        plot_ui: &mut egui_plot::PlotUi<'_>,
+        label: &str,
+        points: &[AlarmPlotPoint],
+    ) {
+        for (idx, alarm) in points.iter().enumerate() {
+            let color = Self::alarm_record_level_color(&alarm.level);
+            let radius = if alarm.cleared { 4.0 } else { 6.0 };
+            plot_ui.points(
+                Points::new(
+                    format!("{label} alarm {idx}"),
+                    PlotPoints::new(vec![alarm.point]),
+                )
+                .color(color)
+                .radius(radius)
+                .filled(!alarm.cleared),
+            );
+        }
+    }
+
     fn draw_can_replay_chart(
         &mut self,
         ui: &mut egui::Ui,
@@ -2674,30 +2985,45 @@ impl UiClientApp {
                         Line::new(labels[0], PlotPoints::new(data.x_points.clone()))
                             .color(egui::Color32::from_rgb(239, 83, 80)),
                     );
+                    if self.can_replay.show_alarm_points {
+                        Self::draw_alarm_plot_points(plot_ui, labels[0], &data.x_alarm_points);
+                    }
                 }
                 if self.can_replay.show_y {
                     plot_ui.line(
                         Line::new(labels[1], PlotPoints::new(data.y_points.clone()))
                             .color(egui::Color32::from_rgb(66, 165, 245)),
                     );
+                    if self.can_replay.show_alarm_points {
+                        Self::draw_alarm_plot_points(plot_ui, labels[1], &data.y_alarm_points);
+                    }
                 }
                 if self.can_replay.show_z {
                     plot_ui.line(
                         Line::new(labels[2], PlotPoints::new(data.z_points.clone()))
                             .color(egui::Color32::from_rgb(102, 187, 106)),
                     );
+                    if self.can_replay.show_alarm_points {
+                        Self::draw_alarm_plot_points(plot_ui, labels[2], &data.z_alarm_points);
+                    }
                 }
                 if self.can_replay.mode == ReplayMode::Sent && self.can_replay.show_u {
                     plot_ui.line(
                         Line::new(labels[3], PlotPoints::new(data.u_points.clone()))
                             .color(egui::Color32::from_rgb(255, 167, 38)),
                     );
+                    if self.can_replay.show_alarm_points {
+                        Self::draw_alarm_plot_points(plot_ui, labels[3], &data.u_alarm_points);
+                    }
                 }
                 if self.can_replay.mode == ReplayMode::Sent && self.can_replay.show_v {
                     plot_ui.line(
                         Line::new(labels[4], PlotPoints::new(data.v_points.clone()))
                             .color(egui::Color32::from_rgb(171, 71, 188)),
                     );
+                    if self.can_replay.show_alarm_points {
+                        Self::draw_alarm_plot_points(plot_ui, labels[4], &data.v_alarm_points);
+                    }
                 }
                 plot_ui.plot_bounds()
             });
@@ -2781,6 +3107,8 @@ impl UiClientApp {
                         ui.toggle_value(&mut self.can_replay.show_u, labels[3]);
                         ui.toggle_value(&mut self.can_replay.show_v, labels[4]);
                     }
+                    ui.separator();
+                    ui.toggle_value(&mut self.can_replay.show_alarm_points, "报警点");
                 });
 
                 ui.label(&self.can_replay.status);
@@ -2814,6 +3142,406 @@ impl UiClientApp {
                 }
             });
         self.can_replay.open = open;
+    }
+
+    fn open_alarm_records(&mut self) {
+        self.alarm_records.open = true;
+        if self.alarm_records.start_ts_input.trim().is_empty()
+            || self.alarm_records.end_ts_input.trim().is_empty()
+        {
+            let end_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let start_ms = end_ms.saturating_sub(ALARM_RECORD_DEFAULT_WINDOW_MS);
+            self.alarm_records.start_ts_input = format_datetime_input(start_ms);
+            self.alarm_records.end_ts_input = format_datetime_input(end_ms);
+        }
+    }
+
+    fn open_can_replay_from_alarm_records(&mut self) {
+        let Some(data) = self.alarm_records.data.as_ref() else {
+            self.alarm_records.status = "请先加载报警记录".to_string();
+            return;
+        };
+        let Some(first_alarm_ts) = data.records.iter().map(|row| row.ts_ms).min() else {
+            self.alarm_records.status = "当前页没有报警记录，无法打开时间分布".to_string();
+            return;
+        };
+        let last_alarm_ts = data
+            .records
+            .iter()
+            .map(|row| row.ts_ms)
+            .max()
+            .unwrap_or(first_alarm_ts);
+        let replay_start_ts = first_alarm_ts.saturating_sub(ALARM_REPLAY_CONTEXT_MS);
+        let replay_end_ts = last_alarm_ts.saturating_add(ALARM_REPLAY_CONTEXT_MS);
+
+        self.can_replay.open = true;
+        self.can_replay.start_ts_input = format_datetime_input(replay_start_ts);
+        self.can_replay.end_ts_input = format_datetime_input(replay_end_ts);
+        let has_can_group = self.alarm_records.show_can_x
+            || self.alarm_records.show_can_y
+            || self.alarm_records.show_can_z;
+        self.can_replay.mode = if has_can_group {
+            ReplayMode::Can3Axis
+        } else {
+            ReplayMode::Sent
+        };
+        self.can_replay.show_x = match self.can_replay.mode {
+            ReplayMode::Can3Axis => self.alarm_records.show_can_x,
+            ReplayMode::Sent => self.alarm_records.show_sent_t1,
+        };
+        self.can_replay.show_y = match self.can_replay.mode {
+            ReplayMode::Can3Axis => self.alarm_records.show_can_y,
+            ReplayMode::Sent => self.alarm_records.show_sent_t1,
+        };
+        self.can_replay.show_z = match self.can_replay.mode {
+            ReplayMode::Can3Axis => self.alarm_records.show_can_z,
+            ReplayMode::Sent => self.alarm_records.show_sent_t2,
+        };
+        self.can_replay.show_u = self.can_replay.mode == ReplayMode::Sent
+            && self.alarm_records.show_sent_t2;
+        self.can_replay.show_v = self.can_replay.mode == ReplayMode::Sent
+            && self.alarm_records.show_sent_s;
+        self.can_replay.data = None;
+        self.can_replay.plot_rect = None;
+        self.request_can_replay_load();
+    }
+
+    fn request_alarm_records_load(&mut self) {
+        self.request_alarm_records_page(0);
+    }
+
+    fn request_alarm_records_page(&mut self, page_index: i64) {
+        if self.alarm_records.loading {
+            self.alarm_records.status = "正在加载，请稍候".to_string();
+            return;
+        }
+
+        let start_ts_ms = match parse_time_input(&self.alarm_records.start_ts_input) {
+            Some(v) => v,
+            None => {
+                self.alarm_records.status = "开始时间无效".to_string();
+                return;
+            }
+        };
+        let end_ts_ms = match parse_time_input(&self.alarm_records.end_ts_input) {
+            Some(v) => v,
+            None => {
+                self.alarm_records.status = "结束时间无效".to_string();
+                return;
+            }
+        };
+        if end_ts_ms <= start_ts_ms {
+            self.alarm_records.status = "结束时间必须大于开始时间".to_string();
+            return;
+        }
+
+        let has_selected_group = self.alarm_records.show_can_x
+            || self.alarm_records.show_can_y
+            || self.alarm_records.show_can_z
+            || self.alarm_records.show_sent_t1
+            || self.alarm_records.show_sent_t2
+            || self.alarm_records.show_sent_s;
+        if !has_selected_group {
+            self.alarm_records.status = "至少选择一个分组".to_string();
+            return;
+        }
+
+        let page_index = page_index.max(0);
+        let offset = page_index * ALARM_RECORD_PAGE_SIZE;
+        let fetch_limit = ALARM_RECORD_PAGE_SIZE + 1;
+        self.alarm_records.loading = true;
+        self.alarm_records.status = format!("正在加载第 {} 页报警记录...", page_index + 1);
+
+        let dsn = self.alarm_records.pg_dsn.clone();
+        let tx = self.ui_tx.clone();
+        let show_can_x = self.alarm_records.show_can_x;
+        let show_can_y = self.alarm_records.show_can_y;
+        let show_can_z = self.alarm_records.show_can_z;
+        let show_sent_t1 = self.alarm_records.show_sent_t1;
+        let show_sent_t2 = self.alarm_records.show_sent_t2;
+        let show_sent_s = self.alarm_records.show_sent_s;
+        thread::spawn(move || {
+            let result = (|| -> Result<AlarmRecordData, String> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| err.to_string())?;
+                rt.block_on(async move {
+                    let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
+                        .await
+                        .map_err(|err| format!("connect postgres failed: {err}; dsn={dsn}"))?;
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+
+                    let total_count: i64 = client
+                        .query_one(
+                            "SELECT COUNT(*)
+                             FROM alarm_events
+                             WHERE ts_ms >= $1
+                               AND ts_ms <= $2
+                               AND (($3 AND alarm_id IN ('can_x_h', 'can_x_l'))
+                                 OR ($4 AND alarm_id IN ('can_y_h', 'can_y_l'))
+                                 OR ($5 AND alarm_id IN ('can_z_h', 'can_z_l'))
+                                 OR ($6 AND (alarm_id IN ('sent_torque_jump_t1', 'sent_angle_jump_t1') OR message LIKE '%t1=1%'))
+                                 OR ($7 AND (alarm_id IN ('sent_torque_jump_t2', 'sent_angle_jump_t2') OR message LIKE '%t2=1%'))
+                                 OR ($8 AND (alarm_id = 'sent_angle_jump_s' OR message LIKE '%s=1%')))",
+                            &[
+                                &start_ts_ms,
+                                &end_ts_ms,
+                                &show_can_x,
+                                &show_can_y,
+                                &show_can_z,
+                                &show_sent_t1,
+                                &show_sent_t2,
+                                &show_sent_s,
+                            ],
+                        )
+                        .await
+                        .map_err(|err| err.to_string())?
+                        .get(0);
+
+                    let rows = client
+                        .query(
+                            "SELECT ts_ms, device_id, alarm_id, level, message, cleared
+                             FROM alarm_events
+                             WHERE ts_ms >= $1
+                               AND ts_ms <= $2
+                               AND (($3 AND alarm_id IN ('can_x_h', 'can_x_l'))
+                                 OR ($4 AND alarm_id IN ('can_y_h', 'can_y_l'))
+                                 OR ($5 AND alarm_id IN ('can_z_h', 'can_z_l'))
+                                 OR ($6 AND (alarm_id IN ('sent_torque_jump_t1', 'sent_angle_jump_t1') OR message LIKE '%t1=1%'))
+                                 OR ($7 AND (alarm_id IN ('sent_torque_jump_t2', 'sent_angle_jump_t2') OR message LIKE '%t2=1%'))
+                                 OR ($8 AND (alarm_id = 'sent_angle_jump_s' OR message LIKE '%s=1%')))
+                             ORDER BY ts_ms ASC, id ASC
+                             LIMIT $9 OFFSET $10",
+                            &[
+                                &start_ts_ms,
+                                &end_ts_ms,
+                                &show_can_x,
+                                &show_can_y,
+                                &show_can_z,
+                                &show_sent_t1,
+                                &show_sent_t2,
+                                &show_sent_s,
+                                &fetch_limit,
+                                &offset,
+                            ],
+                        )
+                        .await
+                        .map_err(|err| err.to_string())?;
+
+                    let has_next = rows.len() as i64 > ALARM_RECORD_PAGE_SIZE;
+                    let records = rows
+                        .into_iter()
+                        .take(ALARM_RECORD_PAGE_SIZE as usize)
+                        .map(|row| AlarmRecordRow {
+                            ts_ms: row.get(0),
+                            device_id: row.get(1),
+                            alarm_id: row.get(2),
+                            level: row.get(3),
+                            message: row.get(4),
+                            cleared: row.get(5),
+                        })
+                        .collect();
+
+                    Ok(AlarmRecordData {
+                        records,
+                        page_index,
+                        has_next,
+                        total_count,
+                    })
+                })
+            })();
+
+            let _ = tx.send(UiMsg::AlarmRecordsLoaded(result));
+        });
+    }
+
+    fn alarm_record_matches_can_axis(row: &AlarmRecordRow, axis: &str) -> bool {
+        row.alarm_id.starts_with(&format!("can_{axis}_"))
+    }
+
+    fn alarm_record_matches_sent_part(row: &AlarmRecordRow, part: &str) -> bool {
+        match part {
+            "t1" => row.alarm_id.ends_with("_t1") || row.message.contains("t1=1"),
+            "t2" => row.alarm_id.ends_with("_t2") || row.message.contains("t2=1"),
+            "s" => row.alarm_id.ends_with("_s") || row.message.contains("s=1"),
+            _ => false,
+        }
+    }
+
+    fn alarm_record_groups(row: &AlarmRecordRow) -> String {
+        let mut groups = Vec::new();
+        if Self::alarm_record_matches_can_axis(row, "x") {
+            groups.push("CAN X");
+        }
+        if Self::alarm_record_matches_can_axis(row, "y") {
+            groups.push("CAN Y");
+        }
+        if Self::alarm_record_matches_can_axis(row, "z") {
+            groups.push("CAN Z");
+        }
+        if Self::alarm_record_matches_sent_part(row, "t1") {
+            groups.push("SENT T1");
+        }
+        if Self::alarm_record_matches_sent_part(row, "t2") {
+            groups.push("SENT T2");
+        }
+        if Self::alarm_record_matches_sent_part(row, "s") {
+            groups.push("SENT S");
+        }
+        if groups.is_empty() {
+            "Other".to_string()
+        } else {
+            groups.join(", ")
+        }
+    }
+
+    fn alarm_record_level_color(level: &str) -> egui::Color32 {
+        match level {
+            "Purple" => egui::Color32::from_rgb(165, 88, 255),
+            "Critical" => egui::Color32::from_rgb(220, 64, 52),
+            "Warning" => egui::Color32::from_rgb(255, 180, 0),
+            "Info" => egui::Color32::from_rgb(82, 170, 255),
+            _ => egui::Color32::WHITE,
+        }
+    }
+
+    fn draw_alarm_records_window(&mut self, ctx: &egui::Context) {
+        if !self.alarm_records.open {
+            return;
+        }
+
+        let mut open = self.alarm_records.open;
+        egui::Window::new("报警记录")
+            .open(&mut open)
+            .default_size(egui::vec2(1040.0, 620.0))
+            .min_width(820.0)
+            .min_height(480.0)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("开始");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.alarm_records.start_ts_input)
+                            .desired_width(172.0),
+                    );
+                    ui.label("结束");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.alarm_records.end_ts_input)
+                            .desired_width(172.0),
+                    );
+                    if ui
+                        .add_enabled(!self.alarm_records.loading, egui::Button::new("加载"))
+                        .clicked()
+                    {
+                        self.request_alarm_records_load();
+                    }
+                    if ui.button("最近5分钟").clicked() {
+                        let end_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        self.alarm_records.start_ts_input =
+                            format_datetime_input(end_ms.saturating_sub(ALARM_RECORD_DEFAULT_WINDOW_MS));
+                        self.alarm_records.end_ts_input = format_datetime_input(end_ms);
+                        self.alarm_records.page_index = 0;
+                        self.alarm_records.has_next = false;
+                        self.alarm_records.data = None;
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("分组");
+                    ui.toggle_value(&mut self.alarm_records.show_can_x, "CAN X");
+                    ui.toggle_value(&mut self.alarm_records.show_can_y, "CAN Y");
+                    ui.toggle_value(&mut self.alarm_records.show_can_z, "CAN Z");
+                    ui.separator();
+                    ui.toggle_value(&mut self.alarm_records.show_sent_t1, "SENT T1");
+                    ui.toggle_value(&mut self.alarm_records.show_sent_t2, "SENT T2");
+                    ui.toggle_value(&mut self.alarm_records.show_sent_s, "SENT S");
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.alarm_records.loading && self.alarm_records.page_index > 0,
+                            egui::Button::new("上一页"),
+                        )
+                        .clicked()
+                    {
+                        self.request_alarm_records_page(self.alarm_records.page_index - 1);
+                    }
+                    ui.label(format!("第 {} 页", self.alarm_records.page_index + 1));
+                    if ui
+                        .add_enabled(
+                            !self.alarm_records.loading && self.alarm_records.has_next,
+                            egui::Button::new("下一页"),
+                        )
+                        .clicked()
+                    {
+                        self.request_alarm_records_page(self.alarm_records.page_index + 1);
+                    }
+                    ui.separator();
+                    if ui.button("时间分布").clicked() {
+                        self.open_can_replay_from_alarm_records();
+                    }
+                });
+
+                ui.label(&self.alarm_records.status);
+                ui.small(format!(
+                    "按时间顺序显示，每页 {} 条，读取 alarm_events",
+                    ALARM_RECORD_PAGE_SIZE
+                ));
+                ui.add_space(6.0);
+
+                if let Some(data) = self.alarm_records.data.clone() {
+                    ui.label(format!("本页 {} 条记录", data.records.len()));
+                    ui.separator();
+                    if data.records.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(80.0);
+                            ui.heading("没有报警记录");
+                        });
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_salt("alarm_records_db_scroll")
+                            .show(ui, |ui| {
+                                for row in &data.records {
+                                    let color = Self::alarm_record_level_color(&row.level);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(format_datetime_input(row.ts_ms));
+                                        ui.colored_label(color, &row.level);
+                                        ui.label(if row.cleared { "已清除" } else { "已触发" });
+                                        ui.label(Self::alarm_record_groups(row));
+                                        ui.label(&row.device_id);
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(row.alarm_id.as_str())
+                                            .monospace()
+                                            .color(color),
+                                    );
+                                    ui.colored_label(color, &row.message);
+                                    ui.separator();
+                                }
+                            });
+                    }
+                } else {
+                    ui.group(|ui| {
+                        ui.set_min_height(260.0);
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(92.0);
+                            ui.heading("报警记录");
+                            ui.label("选择时间范围后点击加载");
+                        });
+                    });
+                }
+            });
+        self.alarm_records.open = open;
     }
 
     fn send_can_self_test(&mut self) {
@@ -2873,6 +3601,9 @@ impl eframe::App for UiClientApp {
                 if ui.button("CAN回放").clicked() {
                     self.open_can_replay();
                 }
+                if ui.button("报警记录").clicked() {
+                    self.open_alarm_records();
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("Test signal");
@@ -2907,6 +3638,7 @@ impl eframe::App for UiClientApp {
         self.draw_can_alarm_indicator(ctx);
         self.draw_can_threshold_panel(ctx);
         self.draw_can_replay_window(ctx);
+        self.draw_alarm_records_window(ctx);
 
         let mut remove_idx = Vec::new();
         for idx in 0..self.dynamic_windows.len() {
